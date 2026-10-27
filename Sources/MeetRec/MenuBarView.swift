@@ -19,17 +19,13 @@ struct MenuBarView: View {
                 level: engine.systemLevel
             )
 
-            if engine.systemAudioFailed {
-                HStack(spacing: 4) {
-                    Label("No permission — recording mic only", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                    Spacer()
-                    Button("Fix…") { ScreenRecordingPermission.openSettings() }
-                        .font(.caption2)
-                        .buttonStyle(.link)
-                }
-                .padding(.leading, 22)
+            if let error = engine.lastError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Recording Permissions…") { ScreenRecordingPermission.openSettings() }
+                    .font(.caption)
             }
 
             channelRow(
@@ -42,6 +38,19 @@ struct MenuBarView: View {
                 level: engine.micLevel
             )
 
+            if let message = engine.recoveryMessage {
+                Label(message, systemImage: "arrow.clockwise.circle")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button("Recover Interrupted Calls") { engine.recoverInterruptedRecordings() }
+                .disabled(engine.isBusy || engine.isRecording)
+                .font(.caption)
+
+            Text("Mute excludes audio from file; capture remains active.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
             Text("⌥⌘M mic · ⌥⌘S system · ⌥⌘R record")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -49,13 +58,20 @@ struct MenuBarView: View {
             Divider()
 
             HStack {
-                Button(engine.isRecording ? "Stop & Reveal" : "Start Recording") {
+                Button(recordButtonTitle) {
                     engine.toggle()
                 }
+                .disabled(engine.isBusy || engine.requiresRestart)
                 .keyboardShortcut(.return, modifiers: [])
                 Spacer()
                 Button("Open Folder") {
-                    NSWorkspace.shared.open(engine.recordingsDirectory)
+                    do {
+                        try RecordingStorage.prepareDirectory(engine.recordingsDirectory)
+                        NSWorkspace.shared.open(engine.recordingsDirectory)
+                    } catch {
+                        let alert = NSAlert(error: error)
+                        alert.runModal()
+                    }
                 }
             }
 
@@ -76,12 +92,23 @@ struct MenuBarView: View {
         .frame(width: 300)
     }
 
+    private var recordButtonTitle: String {
+        if engine.isRecovering { return "Recovering…" }
+        if engine.requiresRestart { return "Restart Required" }
+        switch engine.state {
+        case .starting: return "Starting…"
+        case .stopping: return "Saving…"
+        case .recording: return "Stop & Reveal"
+        case .idle, .failed: return "Start Recording"
+        }
+    }
+
     private var header: some View {
         HStack(spacing: 8) {
             Circle()
                 .fill(engine.isRecording ? Color.red : Color.secondary.opacity(0.5))
                 .frame(width: 10, height: 10)
-            Text(engine.isRecording ? "Recording" : "Idle")
+            Text(engine.lastError != nil ? "Recording error" : (engine.isRecording ? "Recording" : (engine.isBusy ? "Please wait…" : "Idle")))
                 .font(.headline)
             Spacer()
             if engine.isRecording {

@@ -1,0 +1,29 @@
+name: macOS safety checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Toolchain
+        run: swift --version
+      - name: Regression tests (no device capture)
+        run: swift test -Xswiftc -warnings-as-errors
+      - name: Thread Sanitizer
+        run: swift test --sanitize=thread
+      - name: Shell syntax
+        run: bash -n make-app.sh make-icon.sh
+      - name: Build ad-hoc hardened app (no install or permission changes)
+        run: ./make-app.sh
+      - name: Verify signature and bundle
+        run: |
+          codesign --verify --deep --strict MeetRec.app
+          plutil -lint MeetRec.app/Contents/Info.plist

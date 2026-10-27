@@ -18,6 +18,7 @@ enum MicrophoneCaptureError: Error {
 final class MicrophoneCapture {
 
     var onBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
+    var onFailure: ((Error) -> Void)?
     var streamFormat: AVAudioFormat? {
         lock.lock(); defer { lock.unlock() }
         switch impl {
@@ -35,6 +36,15 @@ final class MicrophoneCapture {
     private var impl: Impl = .none
     private var stopped = false
     private let lock = NSLock()
+    private let transitionLock = NSRecursiveLock()
+    private let deliveryLock = NSLock()
+
+    private func deliver(_ buffer: AVAudioPCMBuffer, _ time: AVAudioTime) {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !(lock.withLock { stopped }) else { return }
+        onBuffer?(buffer, time)
+    }
 
     func start() async throws {
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
@@ -52,7 +62,7 @@ final class MicrophoneCapture {
         // VP setup is blocking (CoreAudio calls, possibly seconds) — keep it
         // off the main actor.
         let vp = VoiceProcessingMicCapture()
-        vp.onBuffer = { [weak self] buffer, time in self?.onBuffer?(buffer, time) }
+        vp.onBuffer = { [weak self] buffer, time in self?.deliver(buffer, time) }
         do {
             try await Task.detached(priority: .userInitiated) { try vp.start() }.value
             adoptVP(vp)
@@ -81,21 +91,31 @@ final class MicrophoneCapture {
         Task.detached(priority: .userInitiated) { [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard let self else { return }
-            guard self.isStillActiveVP(vp), vp.bufferCount == 0 else { return }
+            self.fallbackIfNeeded(vp)
+        }
+    }
 
-            Log.write("mic watchdog: AUVoiceIO delivered 0 buffers in 3s — falling back to plain capture")
-            vp.stop()
-            do {
-                try self.startPlain()
-            } catch {
-                Log.write("mic watchdog: CRITICAL — plain fallback also failed (\(error)); no mic for this recording")
-            }
+    private func fallbackIfNeeded(_ vp: VoiceProcessingMicCapture) {
+        transitionLock.lock()
+        defer { transitionLock.unlock() }
+        guard isStillActiveVP(vp), vp.bufferCount == 0 else { return }
+
+        Log.write("mic watchdog: AUVoiceIO delivered 0 buffers in 3s — falling back to plain capture")
+        vp.stop()
+        do {
+            try startPlain()
+        } catch {
+            Log.write("mic watchdog: plain fallback failed (\(error))")
+            if !(lock.withLock { stopped }) { onFailure?(error) }
         }
     }
 
     private func startPlain() throws {
+        transitionLock.lock()
+        defer { transitionLock.unlock() }
+        guard !(lock.withLock { stopped }) else { return }
         let plain = PlainMicCapture()
-        plain.onBuffer = { [weak self] buffer, time in self?.onBuffer?(buffer, time) }
+        plain.onBuffer = { [weak self] buffer, time in self?.deliver(buffer, time) }
         try plain.start()
         lock.lock()
         defer { lock.unlock() }
@@ -111,6 +131,8 @@ final class MicrophoneCapture {
     /// Idempotent. May block in AUVoiceIO teardown — RecordingEngine calls
     /// this from a detached task, never the main thread.
     func stop() {
+        transitionLock.lock()
+        defer { transitionLock.unlock() }
         lock.lock()
         let current = impl
         impl = .none
@@ -122,6 +144,9 @@ final class MicrophoneCapture {
         case .plain(let plain): plain.stop()
         case .none: break
         }
+        // Fence a callback already inside deliver() before finalizing writer.
+        deliveryLock.lock()
+        deliveryLock.unlock()
     }
 }
 
@@ -149,7 +174,13 @@ final class PlainMicCapture {
         }
 
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            throw error
+        }
         Log.write("mic engine started (plain)")
     }
 

@@ -1,295 +1,369 @@
 import Foundation
 import AVFoundation
 
-/// Writes a stereo AAC m4a where both channels carry the same mix of
-/// system audio + microphone (dual-mono), so playback sounds natural on
-/// headphones instead of one voice per ear.
-/// Heartbeat-driven: every 100ms we emit a stereo chunk, padding zeros
-/// for whichever side hasn't delivered samples. This way the recording
-/// continues even if one channel never produces buffers.
-final class StereoWriter {
-
-    private let outputURL: URL
+/// All mutable writer/mixer state belongs to queue. Capture timestamps share
+/// the host clock; timer cadence never determines the recording's duration.
+// Queue-owned state plus locked callback/overload access make cross-thread
+// capture submission safe. AVFoundation objects never escape writer queue.
+final class StereoWriter: @unchecked Sendable {
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
-
+    private let outputURL: URL
     private let queue = DispatchQueue(label: "meetrec.stereo-writer", qos: .userInitiated)
-    private let targetSampleRate: Double = 48_000
-    private let framesPerHeartbeat: Int = 4_800   // 100ms at 48kHz
-
-    private var systemBuffer: [Float] = []
-    private var micBuffer: [Float] = []
-    private var systemConverter: AVAudioConverter?
-    private var micConverter: AVAudioConverter?
-    private var systemSourceFormat: AVAudioFormat?
-    private var micSourceFormat: AVAudioFormat?
-    private let workFormat: AVAudioFormat
-
-    private var heartbeatTimer: DispatchSourceTimer?
-    private var nextSampleTime: Int64 = 0
-    private var systemBuffersIn = 0
-    private var micBuffersIn = 0
-    private var flushesOut = 0
-
-    var systemMuted: Bool = false
-    var micMuted: Bool = false
-
-    /// Linear gain applied to the mic before mixing. Adjustable without UI:
-    ///   defaults write com.local.meetrec MicGainDb -float 6
-    private let micGain: Float = pow(10, Float(UserDefaults.standard.double(forKey: "MicGainDb")) / 20)
+    private let pendingBuffers = DispatchSemaphore(value: 256)
+    private let overloadLock = NSLock()
+    private var overloadReported = false
+    private let sampleRate: Double = 48_000
+    private let chunkSize = 4_800
+    private let latency: Double = 0.25
+    private var system = AudioTimeline(capacity: 480_000)
+    private var mic = AudioTimeline(capacity: 480_000)
+    private var systemConverter: MonoAudioConverter?
+    private var micConverter: MonoAudioConverter?
+    private var systemMuted = false
+    private var micMuted = false
+    private let micGain: Float
+    private var origin: Double?
+    private var timer: DispatchSourceTimer?
+    private var failure: Error?
+    private var finishing = false
+    private var securedFile = false
+    private var encodingFailed = false
+    private var finishReplied = false
+    private var journal: RecordingJournal?
+    private let callbackLock = NSLock()
+    private var failureHandler: ((Error) -> Void)?
+    /// Callback is retrieved under lock and invoked only on writer queue.
+    var onFailure: ((Error) -> Void)? {
+        get { callbackLock.withLock { failureHandler } }
+        set { callbackLock.withLock { failureHandler = newValue } }
+    }
 
     init(outputURL: URL) throws {
         self.outputURL = outputURL
-
-        guard let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                       sampleRate: targetSampleRate,
-                                       channels: 1,
-                                       interleaved: false) else {
-            throw NSError(domain: "StereoWriter", code: 1)
+        // AVAssetWriter also refuses existing files. Never unlink one, even
+        // when initializing a recording that subsequently fails to start.
+        guard !FileManager.default.fileExists(atPath: outputURL.path),
+              (try? FileManager.default.destinationOfSymbolicLink(atPath: outputURL.path)) == nil else {
+            throw RecordingFailure("Refusing to overwrite existing recording: \(outputURL.lastPathComponent)")
         }
-        self.workFormat = mono
-
-        try? FileManager.default.removeItem(at: outputURL)
-
-        self.writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
-
-        let settings: [String: Any] = [
+        let db = UserDefaults.standard.double(forKey: "MicGainDb")
+        micGain = pow(10, Float(db.isFinite ? min(max(db, -60), 24) : 0) / 20)
+        writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
+        input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVNumberOfChannelsKey: 2,
-            AVSampleRateKey: targetSampleRate,
+            AVSampleRateKey: 48_000,
             AVEncoderBitRateKey: 128_000
-        ]
-        self.input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-        self.input.expectsMediaDataInRealTime = true
-
-        guard writer.canAdd(input) else {
-            throw NSError(domain: "StereoWriter", code: 2)
-        }
+        ])
+        input.expectsMediaDataInRealTime = true
+        guard writer.canAdd(input) else { throw RecordingFailure("Cannot initialize audio encoder.") }
         writer.add(input)
     }
 
-    func start() {
-        writer.startWriting()
-        writer.startSession(atSourceTime: .zero)
-        Log.write("writer started, status=\(writer.status.rawValue) url=\(outputURL.lastPathComponent)")
-
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .milliseconds(100),
-                       repeating: .milliseconds(100))
-        timer.setEventHandler { [weak self] in
-            self?.heartbeat()
+    func start() throws {
+        try queue.sync {
+            guard writer.status == .unknown else { throw RecordingFailure("Writer already started.") }
+            journal = try RecordingJournal(outputURL: outputURL)
+            guard writer.startWriting() else {
+                journal?.retainForRecovery()
+                throw writer.error ?? RecordingFailure("Cannot start recording file.")
+            }
+            writer.startSession(atSourceTime: .zero)
+            let heartbeat = DispatchSource.makeTimerSource(queue: queue)
+            heartbeat.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+            heartbeat.setEventHandler { [weak self] in self?.heartbeat() }
+            heartbeat.resume()
+            timer = heartbeat
         }
-        timer.resume()
-        heartbeatTimer = timer
     }
 
-    func finish(_ completion: @escaping () -> Void) {
+    func setMuted(system systemMuted: Bool, mic micMuted: Bool) {
         queue.async { [self] in
-            heartbeatTimer?.cancel()
-            heartbeatTimer = nil
-            heartbeat()  // final flush
-            Log.write("writer finishing — systemBuffersIn=\(systemBuffersIn) micBuffersIn=\(micBuffersIn) flushesOut=\(flushesOut)")
-            guard writer.status == .writing else {
-                Log.write("writer already dead (status=\(writer.status.rawValue) err=\(writer.error?.localizedDescription ?? "nil")) — cancelling")
-                writer.cancelWriting()
-                completion()
+            self.systemMuted = systemMuted
+            self.micMuted = micMuted
+            if systemMuted { system.muteBufferedSamples() }
+            if micMuted { mic.muteBufferedSamples() }
+        }
+    }
+
+    func appendSystem(buffer: AVAudioPCMBuffer, time: AVAudioTime) {
+        append(buffer: buffer, time: time, isSystem: true)
+    }
+
+    func appendMic(buffer: AVAudioPCMBuffer, time: AVAudioTime) {
+        append(buffer: buffer, time: time, isSystem: false)
+    }
+
+    private func append(buffer: AVAudioPCMBuffer, time: AVAudioTime, isSystem: Bool) {
+        // Never retain a tap's borrowed memory after its callback returns.
+        guard pendingBuffers.wait(timeout: .now()) == .success else {
+            overloadLock.lock()
+            let report = !overloadReported
+            overloadReported = true
+            overloadLock.unlock()
+            if report {
+                queue.async { [self] in fail(RecordingFailure("Audio processing overloaded; recording stopped.")) }
+            }
+            return
+        }
+        guard let copy = Self.copyBuffer(buffer) else {
+            pendingBuffers.signal()
+            queue.async { [self] in fail(RecordingFailure("Cannot copy captured audio.")) }
+            return
+        }
+        queue.async { [self] in
+            defer { pendingBuffers.signal() }
+            guard failure == nil, !finishing else { return }
+            guard time.isHostTimeValid else {
+                fail(RecordingFailure("Audio source supplied no host-clock timestamp."))
                 return
             }
-            input.markAsFinished()
-            writer.finishWriting {
-                Log.write("writer finished, status=\(self.writer.status.rawValue) err=\(self.writer.error?.localizedDescription ?? "nil")")
-                completion()
-            }
+            let seconds = AVAudioTime.seconds(forHostTime: time.hostTime)
+            if origin == nil { origin = seconds }
+            let position = Int64(((seconds - origin!) * sampleRate).rounded())
+            do {
+                let values: [Float]
+                if isSystem {
+                    if systemConverter?.sourceFormat.isEqual(copy.format) != true {
+                        try flushSystemConverter()
+                        systemConverter = try MonoAudioConverter(sourceFormat: copy.format)
+                    }
+                    let delay = systemConverter!.pendingFrames
+                    values = try systemConverter!.convert(copy)
+                    try system.append(systemMuted ? Array(repeating: 0, count: values.count) : values, at: position - delay)
+                } else {
+                    if micConverter?.sourceFormat.isEqual(copy.format) != true {
+                        try flushMicConverter()
+                        micConverter = try MonoAudioConverter(sourceFormat: copy.format)
+                    }
+                    let delay = micConverter!.pendingFrames
+                    values = try micConverter!.convert(copy)
+                    try mic.append(micMuted ? Array(repeating: 0, count: values.count) : values, at: position - delay)
+                }
+            } catch { fail(error) }
         }
     }
-
-    func appendSystem(buffer: AVAudioPCMBuffer) {
-        queue.async { [self] in
-            systemBuffersIn += 1
-            // The source format can change mid-recording (e.g. a capture
-            // fallback swaps implementations) — recreate the converter then.
-            if systemConverter == nil || systemSourceFormat?.isEqual(buffer.format) != true {
-                systemConverter = AVAudioConverter(from: buffer.format, to: workFormat)
-                systemSourceFormat = buffer.format
-                Log.write("system converter created from sr=\(buffer.format.sampleRate) ch=\(buffer.format.channelCount)")
-            }
-            guard let conv = systemConverter,
-                  let mono = convert(buffer: buffer, with: conv) else { return }
-            if systemMuted {
-                systemBuffer.append(contentsOf: Array(repeating: 0, count: mono.count))
-            } else {
-                systemBuffer.append(contentsOf: mono)
-            }
-        }
-    }
-
-    func appendMic(buffer: AVAudioPCMBuffer) {
-        queue.async { [self] in
-            micBuffersIn += 1
-            if micConverter == nil || micSourceFormat?.isEqual(buffer.format) != true {
-                micConverter = AVAudioConverter(from: buffer.format, to: workFormat)
-                micSourceFormat = buffer.format
-                Log.write("mic converter created from sr=\(buffer.format.sampleRate) ch=\(buffer.format.channelCount)")
-            }
-            guard let conv = micConverter,
-                  let mono = convert(buffer: buffer, with: conv) else { return }
-            if micMuted {
-                micBuffer.append(contentsOf: Array(repeating: 0, count: mono.count))
-            } else {
-                micBuffer.append(contentsOf: mono)
-            }
-        }
-    }
-
-    // MARK: - Heartbeat
 
     private func heartbeat() {
-        // Decide how many frames this tick. Aim for framesPerHeartbeat,
-        // but don't exceed what either side has if both have data.
-        // If one side is empty, still emit framesPerHeartbeat (zero-padding it).
-        let haveSystem = systemBuffer.count
-        let haveMic = micBuffer.count
-        let target: Int
-        if haveSystem == 0 && haveMic == 0 {
-            return  // truly nothing yet (e.g. before any source started)
+        guard failure == nil, !finishing, let origin else { return }
+        let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        let due = Int64(max(0, now - origin - latency) * sampleRate)
+        do { try drain(through: due) } catch { fail(error) }
+    }
+
+    /// Call only after sources have stopped; all their earlier append blocks
+    /// are ahead of this block. Drain the entire tail, not just one chunk.
+    func finish() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async { [self] in
+                guard !finishing else {
+                    continuation.resume(throwing: RecordingFailure("Writer already finalized."))
+                    return
+                }
+                finishing = true
+                timer?.cancel()
+                timer = nil
+                // Preserve the encoded prefix if draining fails but the encoder
+                // remains usable. Never cancel an otherwise salvageable recording.
+                do {
+                    try flushSystemConverter()
+                    try flushMicConverter()
+                    try drain(through: max(system.end, mic.end))
+                }
+                catch { if failure == nil { failure = error } }
+                do {
+                    try journal?.seal()
+                    guard writer.status == .writing else {
+                        throw writer.error ?? failure ?? RecordingFailure("Recording writer stopped unexpectedly.")
+                    }
+                    input.markAsFinished()
+                    let timeout = DispatchWorkItem { [self] in
+                        guard !finishReplied else { return }
+                        finishReplied = true
+                        journal?.retainForRecovery()
+                        journal = nil
+                        writer.cancelWriting()
+                        continuation.resume(throwing: RecordingFailure("Audio encoder finalization timed out. Audio journal retained for recovery."))
+                    }
+                    queue.asyncAfter(deadline: .now() + .seconds(10), execute: timeout)
+                    writer.finishWriting { [self] in
+                        queue.async {
+                            guard !self.finishReplied else { return }
+                            self.finishReplied = true
+                            timeout.cancel()
+                            do {
+                                guard self.writer.status == .completed else {
+                                    throw self.writer.error ?? RecordingFailure("Could not finalize recording. Recoverable audio retained.")
+                                }
+                                if let error = self.failure { throw error }
+                                let fd = try RecoveryIO.openExisting(self.outputURL)
+                                do { defer { close(fd) }; try RecoveryIO.sync(fd) }
+                                let audio = try AVAudioFile(forReading: self.outputURL)
+                                let expected = self.journal?.frameCount ?? 0
+                                guard audio.length > 0, abs(audio.length - expected) <= 2_048,
+                                      audio.fileFormat.sampleRate == 48_000,
+                                      audio.fileFormat.channelCount == 2 else {
+                                    throw RecordingFailure("Saved audio failed length/format validation; recovery files retained.")
+                                }
+                                try RecoveryIO.syncDirectory(self.outputURL.deletingLastPathComponent())
+                                try self.journal?.discardAfterSuccessfulSave()
+                                self.journal = nil
+                                continuation.resume()
+                            } catch {
+                                self.journal?.retainForRecovery()
+                                self.journal = nil
+                                continuation.resume(throwing: error)
+                            }
+                        }
+                    }
+                } catch {
+                    journal?.retainForRecovery()
+                    journal = nil
+                    writer.cancelWriting()
+                    continuation.resume(throwing: error)
+                }
+            }
         }
-        target = min(framesPerHeartbeat, max(haveSystem, haveMic))
-        guard target > 0 else { return }
+    }
 
-        var interleaved = [Float](repeating: 0, count: target * 2)
-
-        let sysN = min(target, haveSystem)
-        let micN = min(target, haveMic)
-        for i in 0..<target {
-            let sys = i < sysN ? systemBuffer[i] : 0
-            let mic = i < micN ? micBuffer[i] * micGain : 0
-            let mixed = Self.softClip(sys + mic)
-            interleaved[i * 2] = mixed
-            interleaved[i * 2 + 1] = mixed
+    private func drain(through end: Int64) throws {
+        // A large scheduling gap should not allocate an unbounded silent file.
+        guard end - system.cursor <= Int64(system.capacity) else {
+            throw RecordingFailure("Audio clock stalled for over 10 seconds; recording stopped.")
         }
-        if sysN > 0 { systemBuffer.removeFirst(sysN) }
-        if micN > 0 { micBuffer.removeFirst(micN) }
+        while system.cursor < end {
+            let count = Int(min(Int64(chunkSize), end - system.cursor))
+            let position = system.cursor
+            let sys = system.read(count)
+            let own = mic.read(count)
+            var mixed = [Float](repeating: 0, count: count * 2)
+            var mono = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let value = Self.softClip(sys[i] + own[i] * micGain)
+                mono[i] = value
+                mixed[2 * i] = value
+                mixed[2 * i + 1] = value
+            }
+            // Journal first: AAC/metadata finalization must never be the sole
+            // durable copy. Journal contains exactly the post-mute saved mix.
+            try journal?.append(mono)
+            if !encodingFailed {
+                do {
+                    try encode(mixed, frames: count, position: position)
+                } catch {
+                    encodingFailed = true
+                    fail(error)
+                    // Keep journaling the remaining accepted audio even if
+                    // AAC dies; finish() will retain all segments for recovery.
+                }
+            }
+        }
+    }
 
-        guard let cmBuffer = makeCMSampleBuffer(from: interleaved, frameCount: target) else { return }
+    private func encode(_ mixed: [Float], frames: Int, position: Int64) throws {
+        let buffer = try makeSampleBuffer(mixed, frames: frames, position: position)
+        let deadline = DispatchTime.now() + .seconds(2)
         while !input.isReadyForMoreMediaData {
-            // A failed writer never becomes ready — bail out instead of
-            // spinning forever and blocking this queue (finish() would hang).
             guard writer.status == .writing else {
-                Log.write("writer no longer writing (status=\(writer.status.rawValue)) — dropping chunk")
-                heartbeatTimer?.cancel()
-                heartbeatTimer = nil
-                return
+                throw writer.error ?? RecordingFailure("Audio encoder stopped writing.")
+            }
+            guard DispatchTime.now() < deadline else {
+                throw RecordingFailure("Audio encoder stalled; recording stopped.")
             }
             Thread.sleep(forTimeInterval: 0.001)
         }
-        let ok = input.append(cmBuffer)
-        if ok {
-            flushesOut += 1
-            nextSampleTime += Int64(target)
-            if flushesOut == 1 || flushesOut % 50 == 0 {
-                Log.write("flush #\(flushesOut) frames=\(target) sysSrc=\(sysN) micSrc=\(micN)")
-            }
-        } else {
-            Log.write("append FAILED, writer status=\(writer.status.rawValue) err=\(writer.error?.localizedDescription ?? "nil")")
+        guard input.append(buffer) else {
+            throw writer.error ?? RecordingFailure("Cannot write audio; check available disk space.")
+        }
+        if !securedFile {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
+            securedFile = true
         }
     }
 
-    /// Linear below the knee; the overshoot is squeezed into the remaining
-    /// headroom so two simultaneously loud sources can't hard-clip.
-    private static func softClip(_ x: Float) -> Float {
+    private func fail(_ error: Error) {
+        guard failure == nil else { return }
+        failure = error
+        timer?.cancel()
+        timer = nil
+        Log.write("recording writer failed: \(error.localizedDescription)")
+        onFailure?(error)
+    }
+
+    static func softClip(_ value: Float) -> Float {
+        guard value.isFinite else { return 0 }
         let knee: Float = 0.95
-        let a = abs(x)
-        guard a > knee else { return x }
+        let a = abs(value)
+        guard a > knee else { return value }
         let squeezed = knee + (1 - knee) * tanh((a - knee) / (1 - knee))
-        return x < 0 ? -squeezed : squeezed
+        return value < 0 ? -squeezed : squeezed
     }
 
-    private func convert(buffer: AVAudioPCMBuffer, with converter: AVAudioConverter) -> [Float]? {
-        let ratio = workFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
-        guard let out = AVAudioPCMBuffer(pcmFormat: workFormat, frameCapacity: capacity) else { return nil }
-
-        var supplied = false
-        var error: NSError?
-        let status = converter.convert(to: out, error: &error) { _, outStatus in
-            if supplied {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            supplied = true
-            outStatus.pointee = .haveData
-            return buffer
+    static func copyBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: source.frameLength) else { return nil }
+        copy.frameLength = source.frameLength
+        let from = UnsafeMutableAudioBufferListPointer(source.mutableAudioBufferList)
+        let to = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        guard from.count == to.count else { return nil }
+        for i in 0..<from.count {
+            guard let src = from[i].mData, let dst = to[i].mData,
+                  from[i].mDataByteSize <= to[i].mDataByteSize else { return nil }
+            memcpy(dst, src, Int(from[i].mDataByteSize))
         }
-        if status == .error || error != nil { return nil }
-
-        let n = Int(out.frameLength)
-        guard let ch = out.floatChannelData?[0] else { return nil }
-        return Array(UnsafeBufferPointer(start: ch, count: n))
+        return copy
     }
 
-    private func makeCMSampleBuffer(from interleaved: [Float], frameCount: Int) -> CMSampleBuffer? {
-        var asbd = AudioStreamBasicDescription(
-            mSampleRate: targetSampleRate,
+    private func flushSystemConverter() throws {
+        guard let converter = systemConverter else { return }
+        let tail = try converter.finish()
+        try system.append(systemMuted ? Array(repeating: 0, count: tail.count) : tail, at: system.end)
+        systemConverter = nil
+    }
+
+    private func flushMicConverter() throws {
+        guard let converter = micConverter else { return }
+        let tail = try converter.finish()
+        try mic.append(micMuted ? Array(repeating: 0, count: tail.count) : tail, at: mic.end)
+        micConverter = nil
+    }
+
+    private func makeSampleBuffer(_ values: [Float], frames: Int, position: Int64) throws -> CMSampleBuffer {
+        var asbd = AudioStreamBasicDescription(mSampleRate: sampleRate,
             mFormatID: kAudioFormatLinearPCM,
             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-            mBytesPerPacket: 8,
-            mFramesPerPacket: 1,
-            mBytesPerFrame: 8,
-            mChannelsPerFrame: 2,
-            mBitsPerChannel: 32,
-            mReserved: 0
-        )
-
+            mBytesPerPacket: 8, mFramesPerPacket: 1, mBytesPerFrame: 8,
+            mChannelsPerFrame: 2, mBitsPerChannel: 32, mReserved: 0)
         var format: CMAudioFormatDescription?
-        var status = CMAudioFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            asbd: &asbd,
-            layoutSize: 0, layout: nil,
-            magicCookieSize: 0, magicCookie: nil,
-            extensions: nil,
-            formatDescriptionOut: &format
-        )
-        guard status == noErr, let fmt = format else { return nil }
-
-        let byteCount = frameCount * Int(asbd.mBytesPerFrame)
-        var blockBuffer: CMBlockBuffer?
-        status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: byteCount,
-            blockAllocator: nil, customBlockSource: nil,
-            offsetToData: 0, dataLength: byteCount,
-            flags: 0, blockBufferOut: &blockBuffer
-        )
-        guard status == noErr, let block = blockBuffer else { return nil }
-
-        _ = interleaved.withUnsafeBufferPointer { ptr -> OSStatus in
-            CMBlockBufferReplaceDataBytes(
-                with: ptr.baseAddress!, blockBuffer: block,
-                offsetIntoDestination: 0, dataLength: byteCount
-            )
+        guard CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd,
+            layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil,
+            extensions: nil, formatDescriptionOut: &format) == noErr, let format else {
+            throw RecordingFailure("Cannot create audio format description.")
         }
-
-        var sampleBuffer: CMSampleBuffer?
-        let timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: CMTimeScale(targetSampleRate)),
-            presentationTimeStamp: CMTime(value: nextSampleTime, timescale: CMTimeScale(targetSampleRate)),
-            decodeTimeStamp: .invalid
-        )
-        var timingArr = [timing]
-        var sampleSizeArr = [Int](repeating: Int(asbd.mBytesPerFrame), count: frameCount)
-
-        status = CMSampleBufferCreate(
-            allocator: kCFAllocatorDefault,
-            dataBuffer: block, dataReady: true,
-            makeDataReadyCallback: nil, refcon: nil,
-            formatDescription: fmt,
-            sampleCount: frameCount,
-            sampleTimingEntryCount: 1, sampleTimingArray: &timingArr,
-            sampleSizeEntryCount: frameCount, sampleSizeArray: &sampleSizeArr,
-            sampleBufferOut: &sampleBuffer
-        )
-        guard status == noErr else { return nil }
-        return sampleBuffer
+        var block: CMBlockBuffer?
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+            memoryBlock: nil, blockLength: values.count * 4, blockAllocator: nil,
+            customBlockSource: nil, offsetToData: 0, dataLength: values.count * 4,
+            flags: 0, blockBufferOut: &block) == noErr, let block else {
+            throw RecordingFailure("Cannot allocate encoded audio buffer.")
+        }
+        let copied = values.withUnsafeBytes { bytes in
+            CMBlockBufferReplaceDataBytes(with: bytes.baseAddress!, blockBuffer: block,
+                                           offsetIntoDestination: 0, dataLength: bytes.count)
+        }
+        guard copied == noErr else { throw RecordingFailure("Cannot copy audio samples.") }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48_000),
+            presentationTimeStamp: CMTime(value: position, timescale: 48_000), decodeTimeStamp: .invalid)
+        var size = 8
+        var result: CMSampleBuffer?
+        guard CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: block,
+            dataReady: true, makeDataReadyCallback: nil, refcon: nil,
+            formatDescription: format, sampleCount: frames,
+            sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &size,
+            sampleBufferOut: &result) == noErr, let result else {
+            throw RecordingFailure("Cannot create audio sample buffer.")
+        }
+        return result
     }
 }

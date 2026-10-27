@@ -1,144 +1,173 @@
 # MeetRec
 
-[![macOS](https://img.shields.io/badge/macOS-14.2%2B-blue)](https://www.apple.com/macos/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/BozhengLong/meetrec)](https://github.com/BozhengLong/meetrec/releases)
+Local macOS menu-bar recorder for microphone + system audio. No cloud, account,
+bot, analytics, network client, or third-party Swift dependencies.
 
-**English** | [简体中文](README.zh-CN.md)
+Independently maintained for reliable local call recording. No upstream-sync
+commitment. **Use this repository's source; releases from other repositories do
+not contain these safety changes.**
 
-**One-click meeting recorder that lives in your Mac's menu bar.** It records both sides of any meeting, call, or livestream — their voices and yours — into a single audio file on your disk. Everything stays local: no cloud, no account, no bot joining your call.
+## Build and use
 
-<img src="docs/popover.png" width="330" alt="MeetRec popover while recording — live level meters for system audio and microphone">
-
-## Install
-
-Download `MeetRec.app.zip` from [Releases](https://github.com/BozhengLong/meetrec/releases), unzip, drag `MeetRec.app` to `/Applications`.
-
-On first launch macOS blocks it (signed but not notarized). One-time fix, either way:
-
-- System Settings → Privacy & Security → scroll down → **Open Anyway**, or
-- `xattr -dr com.apple.quarantine /Applications/MeetRec.app`
-
-MeetRec then walks you through the two permissions it needs. Prefer building from source? [See below](#building-from-source) — no Gatekeeper step.
-
-## What it does
-
-- 🎙️ Records **the whole conversation** — system audio + microphone, mixed naturally into one m4a; works with AirPods
-- 🔊 **Echo cancellation, noise suppression, auto gain** on the mic — recording on speakers doesn't pick up an echo of the other side
-- 🔇 Mute either side live, with global hotkeys
-- 🚦 Warns loudly (alert + menu bar icon) if a recording is somehow missing system audio — never a silent failure
-- 💾 Saves to `~/Recordings/YYYY-MM-DD_HHMM.m4a`, reveals in Finder on stop
-
-| Hotkey | Action |
-|---|---|
-| `⌥⌘R` | Start / stop recording |
-| `⌥⌘M` | Toggle microphone |
-| `⌥⌘S` | Toggle system audio |
-
-## After recording
-
-MeetRec deliberately stops at "make a clean audio file" — no built-in transcription. Feed the m4a to [MacWhisper](https://goodsnooze.gumroad.com/l/macwhisper), [Buzz](https://github.com/chidiwilliams/buzz), ChatGPT, or:
+Requires macOS 14.2+ and Xcode 15+/Swift 5.9+ (tested locally with Swift 6.2.4).
 
 ```bash
-whisper-cli -m models/ggml-large-v3.bin -f 2026-05-24_1430.m4a -l zh
+git clone https://github.com/lxhan/meetrec.git
+cd meetrec
+swift test
+./make-app.sh
+open MeetRec.app
 ```
 
-Both channels carry the same mix; speaker separation is your transcriber's diarization job.
+Build creates `MeetRec.app` locally; it does not install, launch, kill an existing
+recorder, select a keychain signing identity, or reset permissions. Quit/save any
+running instance before rebuilding. Default signing is ad-hoc with hardened
+runtime and microphone entitlement; it is **not notarized or sandboxed**.
 
-<details>
-<summary><strong>Optional tweaks</strong></summary>
+For stable signing across rebuilds, explicitly select your own identity:
 
 ```bash
-# Your own voice too quiet/loud in the mix? Mic gain in dB (default 0):
-defaults write com.local.meetrec MicGainDb -float 6
+./make-app.sh --sign 'Apple Development: Your Name (TEAMID)'
+```
 
-# Prefer the raw, unprocessed mic sound? Turn off echo cancellation & co:
+Ad-hoc rebuilds may require re-granting permissions. App-specific TCC reset is an
+explicit last resort, never a default build side effect:
+
+```bash
+./make-app.sh --reset-permissions
+```
+
+On launch, grant **Microphone** and **Screen Recording** when requested. macOS
+uses Screen Recording permission for ScreenCaptureKit system audio; no video is
+saved. Relaunch guidance is provided. Keep `com.local.meetrec` bundle identity
+stable. Do not grant additional permissions or disable system security globally.
+
+Click menu-bar icon → **Start Recording**. **Stop & Reveal** saves and reveals the
+file. Quit/relaunch also stops capture and awaits file finalization, including if
+startup is still in progress. Start fails rather than silently recording mic-only.
+Runtime capture/encoder errors stop recording and remain visible in menu bar/UI.
+Hardware shutdown has a deadline: if an OS audio call hangs, file delivery is
+fenced, output is finalized, and a persistent warning requires quit/relaunch.
+Capture may remain active until quitting in that exceptional case.
+
+| Shortcut | Action |
+|---|---|
+| `⌥⌘R` | Start/stop |
+| `⌥⌘M` | Toggle microphone in saved mix |
+| `⌥⌘S` | Toggle system audio in saved mix |
+
+## Interrupted-call recovery
+
+While recording, a private write-ahead journal stores the post-mute mixed audio
+in one-minute PCM parts under `~/Recordings/MeetRec/.recovery/`. It checkpoints to
+disk roughly every second and is independent of AAC finalization.
+
+- Normal stop verifies and syncs the final `.m4a`, then removes its journal.
+- After a crash/force-kill, next launch automatically exports available audio as
+  `Recovered_UUID.caf` in the recording folder. Core Audio File playback is supported
+  by macOS and VLC; recovered files are uncompressed, not AAC.
+- **Recover Interrupted Calls** retries exports after a failure without restarting.
+- Live sessions are locked and skipped; failed exports retain original segments.
+- Temporary journal uses about **0.7 GB/hour**, plus compressed recording. Recovery
+  temporarily needs enough extra disk space for another uncompressed copy.
+- Audio still in device/application buffers can be lost on abrupt termination.
+  Disk flushes reduce power-loss exposure, but are not a guarantee against hardware
+  failure or filesystem corruption. Real-device/power-loss testing remains necessary.
+
+## Files and privacy
+
+Recordings go to:
+
+```
+~/Recordings/MeetRec/YYYY-MM-DD_HHmmss_UUID.m4a
+```
+
+- Unique filenames; existing recordings are never deleted to start a new one.
+- App recording directory is owner-only (`0700`); saved audio is `0600`.
+- AAC 128 kbps, 48 kHz, dual-mono: both channels contain the same mix.
+- Microphone tries voice processing (echo cancellation/noise reduction/AGC),
+  falling back to plain capture if initialization fails or no buffers arrive.
+- **System capture includes other audible applications**, not just meeting app.
+- **Mute excludes samples from file, not device capture.** Stop recording to stop
+  capture. The meter is hidden for muted channels; this is not a hardware mute.
+- Files are not app-encrypted. Other software running as your user, backups, or a
+  synced/custom filesystem location may access them. Use FileVault where appropriate.
+- No plaintext diagnostic log is created. Opt-in diagnostics use OS-managed
+  unified logging with private fields:
+
+```bash
+defaults write com.local.meetrec DiagnosticsEnabled -bool true
+# Disable after troubleshooting:
+defaults delete com.local.meetrec DiagnosticsEnabled
+```
+
+Optional microphone settings (restart app after changing):
+
+```bash
+defaults write com.local.meetrec MicGainDb -float 6  # clamped to -60…24 dB
 defaults write com.local.meetrec DisableAEC -bool true
 ```
 
-</details>
+Obtain participant consent where required. For transcription, use a separate local
+tool; uploading recordings to external services is outside MeetRec's local-only design.
 
-## Permissions
+## Recording safety
 
-| Permission | Why |
-|---|---|
-| Microphone | Records your voice |
-| Screen Recording | macOS gates system-audio capture behind it. **No video is ever saved** |
+- Unique recording names; refusal to overwrite existing files/symlinks.
+- Explicit starting/recording/stopping/failed lifecycle; idempotent shutdown.
+- Capture-delivery fences, bounded hardware shutdown, and full buffered-tail drain
+  before file finalization; stuck devices require restart instead of hanging saves.
+- Source/encoder failures propagated to persistent UI error state; no false save success.
+- Write-ahead audio journal, locked sessions, automatic crash recovery, verified
+  export before source deletion, and encoder-finalization deadline.
+- Timestamp-indexed bounded rings, shared host-clock timing, catch-up draining,
+  bounded pending capture submissions and encoder readiness timeout.
+- Complete packet-aware sample conversion and resampler-tail flushing, including
+  converter-delay compensation on the host-clock timeline.
+- Queue-serialized mute state; borrowed capture buffers copied before queueing;
+  stale-session callbacks cannot stop a new recording.
+- Native `NSStatusItem`/`NSPopover`, inspired by upstream PR #3, without changing
+  bundle ID as a workaround. Hotkeys register at launch, not only after opening UI.
+- Relaunch uses argument-array `open`, never interpolated shell code.
+- Private storage, opt-in private diagnostics, explicit signing/TCC build options.
+- Automated regression tests and macOS CI.
 
-MeetRec detects what's missing at launch and guides you. If things ever get stuck, the last resort is `tccutil reset ScreenCapture com.local.meetrec`, then relaunch and re-grant.
-
-## Known limitations
-
-- **No pause** — stop & restart creates a new file
-- **Prebuilt app is Apple Silicon only** — Intel Macs: build from source
-- **Not notarized** — first launch needs the one-time Gatekeeper step (see Install)
-- **Switching the output device mid-recording** is untested; switching the input device mid-recording keeps capturing from the original mic (by design)
-
-## Building from source
-
-Requires macOS 14.2+ and an Xcode 15+ / Swift 5.9+ toolchain.
+## Verification
 
 ```bash
-git clone https://github.com/BozhengLong/meetrec.git
-cd meetrec
-./make-app.sh         # → ./MeetRec.app
+swift test -Xswiftc -warnings-as-errors
+swift test --sanitize=thread
+./make-app.sh
+codesign --verify --deep --strict MeetRec.app
 ```
 
-Locally built apps aren't quarantined, so there's no Gatekeeper prompt. With an Apple Development certificate present, `make-app.sh` signs with it automatically and your permission grants survive rebuilds.
+Tests use fake capture devices and synthetic PCM; they do not request microphone
+or screen permission. Coverage includes file collisions, symlinks/permissions,
+start/stop races, shutdown during startup, stale callbacks, capture/writer failure,
+ring wrapping/gaps/overflow, concurrent mute/submission, shutdown deadlines,
+late hardware completion, full encoded tail, journal rotation, truncated writes,
+recovery locking, exact recovered samples, and actual SIGKILL of a journal writer.
 
-<details>
-<summary><strong>Architecture</strong></summary>
+**Not yet validated:** real call audio quality, AirPods/device changes, long-call
+clock behavior, sleep/wake, and recent macOS menu-bar behavior. See
+[manual smoke-test checklist](docs/testing.md).
 
-```
-┌──────────────────────────────────┐
-│  SCStream (capturesAudio=true)   │  ← system audio
-│  AUVoiceIO / AVAudioEngine       │  ← microphone (AEC + NS + AGC)
-│      ↓ (independent callbacks)   │
-│  StereoWriter                    │  ← heartbeat-flushed every 100ms,
-│      ↓                           │     pads silence for the muted side
-│  AVAssetWriter → AAC m4a stereo  │
-└──────────────────────────────────┘
-```
+### Remaining limitations
 
-- `SystemAudioCapture` — wraps `SCStream` with `capturesAudio=true` and a minimal 2×2 video stream that's discarded inside SCKit.
-- `MicrophoneCapture` — facade: tries `VoiceProcessingMicCapture` (direct AUVoiceIO: AEC + noise suppression + AGC) first, with a 3s zero-buffer watchdog that swaps in a fresh plain `AVAudioEngine` capture so the mic is never silently lost. (AVAudioEngine's own `setVoiceProcessingEnabled` is a dead end for tap-only capture — see the notes in the source.)
-- `VoiceProcessingMicCapture` — low-level `kAudioUnitSubType_VoiceProcessingIO` setup: silence render callback on the output element (required to drive the input side), ducking configured to minimum so recorded system audio isn't attenuated, client format follows the unit's own sample rate.
-- `StereoWriter` — own dispatch queue, two mono Float32 ring buffers, every 100ms mixes both sources (mic gain + soft clip) and emits a dual-mono stereo chunk through `AVAssetWriter`. Mute = append zeros instead of samples; the timeline stays aligned, no click/pop.
-- `ScreenRecordingPermission` — launch preflight (`CGPreflightScreenCaptureAccess`), guided Settings deep-link, grant polling, one-click relaunch.
-- `HotKeyManager` — Carbon `RegisterEventHotKey`, no dependencies.
-- `AudioLevel` — peak-detection over PCM buffers for the level meters.
-
-### File layout
-
-```
-meetrec/
-├── Package.swift
-├── make-app.sh                   # builds + packages MeetRec.app
-├── LICENSE
-├── README.md
-└── Sources/MeetRec/
-    ├── MeetRecApp.swift          # app entry, MenuBarExtra, hotkey wiring
-    ├── MenuBarView.swift         # SwiftUI popover with level meters
-    ├── RecordingEngine.swift     # orchestrator (ObservableObject)
-    ├── SystemAudioCapture.swift  # ScreenCaptureKit-based system audio
-    ├── MicrophoneCapture.swift   # facade: AEC-first + plain fallback
-    ├── VoiceProcessingMicCapture.swift # low-level AUVoiceIO (AEC/NS/AGC)
-    ├── ScreenRecordingPermission.swift # launch preflight + guided setup
-    ├── StereoWriter.swift        # AVAssetWriter + dual-mono mixdown
-    ├── HotKeyManager.swift       # Carbon global hotkeys
-    ├── AudioLevel.swift          # peak detection for meters
-    └── Log.swift                 # file-based logger
-```
-
-</details>
-
-<details>
-<summary><strong>Why not Core Audio Process Taps?</strong></summary>
-
-The Process Tap API (`AudioHardwareCreateProcessTap`, macOS 14.2+) is the "obvious" way to capture system audio. We tried it first. It works on built-in speakers and most output devices — but **silently fails when the default output is Bluetooth in HFP/SCO mode** (AirPods etc. while your app is also recording from the mic). In that case macOS switches the Bluetooth profile to the lower-bandwidth call mode, and the tap's IO proc never fires — `AudioDeviceStart` returns `noErr` but no callbacks come in. ScreenCaptureKit's audio path sits above CoreAudio's device routing and doesn't have this issue.
-
-</details>
+- No pause/resume, app/device selector, separate source tracks, or transcription.
+- Interrupted AAC files may remain unplayable; recovery exports journal audio as
+  `.caf` instead. Buffered, not-yet-journaled audio and catastrophic disk failures
+  remain outside recovery guarantees. Keep a backup for important meetings.
+- System audio silence can legitimately omit buffers; stream errors are reported,
+  but absence alone does not prove failure. Microphone uses buffer liveness, not
+  signal volume, to detect interruptions.
+- Input-device switching does not automatically follow new default; output changes
+  remain hardware-dependent. Long interruptions/overload fail explicitly rather
+  than allocating unbounded memory or hiding gaps.
+- Neither notarization nor reproducible source/binary equivalence is established.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; original attribution retained in [LICENSE](LICENSE).
+Originally based on [BozhengLong/meetrec](https://github.com/BozhengLong/meetrec)
+commit `f98e39b`.

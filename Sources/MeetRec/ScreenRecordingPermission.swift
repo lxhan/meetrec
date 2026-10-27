@@ -9,6 +9,7 @@ import CoreGraphics
 @MainActor
 enum ScreenRecordingPermission {
 
+    static let relaunchNotification = Notification.Name("MeetRecRelaunchRequested")
     static var hasAccess: Bool { CGPreflightScreenCaptureAccess() }
 
     private static let settingsURL = URL(string:
@@ -74,11 +75,6 @@ enum ScreenRecordingPermission {
     }
 
     private static func relaunch() {
-        let path = Bundle.main.bundlePath
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "sleep 0.5; /usr/bin/open \"\(path)\""]
-        try? task.run()
-        NSApp.terminate(nil)
+        NotificationCenter.default.post(name: relaunchNotification, object: nil)
     }
 }

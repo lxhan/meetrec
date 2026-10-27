@@ -19,6 +19,9 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var handleCount = 0
 
     var onBuffer: ((AVAudioPCMBuffer, AVAudioTime) -> Void)?
+    var onFailure: ((Error) -> Void)?
+    private let stateLock = NSLock()
+    private var stopping = false
 
     func start() async throws {
         Log.write("sck: requesting shareable content")
@@ -56,6 +59,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
         Log.write("sck: stream created, starting capture")
 
+        self.stream = stream
         do {
             try await stream.startCapture()
         } catch {
@@ -68,6 +72,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stop() async {
+        stateLock.withLock { stopping = true }
         do {
             try await stream?.stopCapture()
             Log.write("sck: stopped, total buffers=\(handleCount)")
@@ -75,6 +80,11 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.write("sck: stop error \(error)")
         }
         stream = nil
+        // stopCapture completes before all already-enqueued sample-handler
+        // blocks necessarily return. Fence them before writer finalization.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            audioQueue.async { continuation.resume() }
+        }
     }
 
     // MARK: - SCStreamOutput
@@ -88,13 +98,24 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.write("sck: audio buffer #\(handleCount) samples=\(sampleBuffer.numSamples)")
         }
 
-        guard let pcm = pcmBuffer(from: sampleBuffer) else { return }
-        let time = AVAudioTime(sampleTime: AVAudioFramePosition(handleCount), atRate: 48_000)
+        guard !(stateLock.withLock { stopping }) else { return }
+        guard let pcm = pcmBuffer(from: sampleBuffer) else {
+            onFailure?(RecordingFailure("Cannot decode system audio buffer."))
+            return
+        }
+        let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+        guard seconds.isFinite, seconds >= 0 else {
+            onFailure?(RecordingFailure("Invalid system audio timestamp."))
+            return
+        }
+        // ScreenCaptureKit presentation timestamps use the host clock.
+        let time = AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: seconds))
         onBuffer?(pcm, time)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.write("sck: stream stopped with error \(error)")
+        if !(stateLock.withLock { stopping }) { onFailure?(error) }
     }
 
     // MARK: - CMSampleBuffer → AVAudioPCMBuffer

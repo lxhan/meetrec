@@ -186,6 +186,40 @@ final class RecordingEngineTests: XCTestCase {
         try await Task.sleep(nanoseconds: 250_000_000)
     }
 
+    func testRecoveryBlocksRecordingUntilExportCompletes() async throws {
+        try RecordingStorage.prepareDirectory(directory)
+        let journal = try RecordingJournal(outputURL: directory.appendingPathComponent("interrupted.m4a"))
+        try journal.append([0.1, 0.2, 0.3])
+        journal.retainForRecovery()
+        engine.recoverInterruptedRecordings()
+        XCTAssertTrue(engine.isRecovering)
+        engine.start()
+        XCTAssertEqual(engine.state, .idle)
+        await engine.waitForRecovery()
+        XCTAssertFalse(engine.isRecovering)
+        XCTAssertTrue(engine.recoveryMessage?.contains("Recovered 1") == true)
+        XCTAssertTrue(try RecordingRecovery.pending(in: directory).isEmpty)
+    }
+
+    func testRecoveryDoesNotInterruptActiveRecording() async throws {
+        engine.start()
+        try await waitFor(.recording)
+        engine.recoverInterruptedRecordings()
+        XCTAssertFalse(engine.isRecovering)
+        XCTAssertEqual(engine.state, .recording)
+    }
+
+    func testRecoveryErrorIsVisibleAndKeepsSource() async throws {
+        try RecordingStorage.prepareDirectory(directory)
+        let journal = try RecordingJournal(outputURL: directory.appendingPathComponent("interrupted.m4a"))
+        journal.retainForRecovery()
+        try Data("bad manifest".utf8).write(to: journal.directory.appendingPathComponent("session.json"))
+        engine.recoverInterruptedRecordings()
+        await engine.waitForRecovery()
+        XCTAssertTrue(engine.recoveryMessage?.contains("remain on disk") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: journal.directory.path))
+    }
+
     func testFinishFailureNeverRevealsAsSuccessfulSave() async throws {
         writer.finishError = RecordingFailure("disk full")
         engine.start()

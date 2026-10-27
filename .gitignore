@@ -21,3 +21,7 @@ build/
 # Logs and recordings (in case anyone runs from this dir)
 *.log
 *.m4a
+*.caf
+*.pcm
+.recovery/
+.MeetRec-build.*/

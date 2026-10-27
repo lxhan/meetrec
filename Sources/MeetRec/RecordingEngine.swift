@@ -37,13 +37,15 @@ final class RecordingEngine: ObservableObject {
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var lastError: String?
     @Published private(set) var requiresRestart = false
+    @Published private(set) var isRecovering = false
+    @Published private(set) var recoveryMessage: String?
     @Published private(set) var lastOutputURL: URL?
     @Published private(set) var systemLevel: Float = 0
     @Published private(set) var micLevel: Float = 0
     @Published var systemMuted = false { didSet { updateMute() } }
     @Published var micMuted = false { didSet { updateMute() } }
     var isRecording: Bool { state == .recording }
-    var isBusy: Bool { state == .starting || state == .stopping }
+    var isBusy: Bool { state == .starting || state == .stopping || isRecovering }
 
     let recordingsDirectory: URL
     private let makeSystem: () -> SystemCapturing
@@ -55,6 +57,7 @@ final class RecordingEngine: ObservableObject {
     private var writer: AudioWriting?
     private var startTask: Task<Void, Never>?
     private var stopTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var timer: Timer?
     private var lastToggle = Date.distantPast
     private var startUptime: TimeInterval = 0
@@ -79,6 +82,29 @@ final class RecordingEngine: ObservableObject {
         self.shutdownTimeout = shutdownTimeout
         self.revealOutput = revealOutput
     }
+
+    func recoverInterruptedRecordings() {
+        guard !isBusy, !isRecording, startTask == nil, stopTask == nil else { return }
+        isRecovering = true
+        let directory = recordingsDirectory
+        recoveryTask = Task {
+            let result = await Task.detached(priority: .utility) {
+                RecordingRecovery.recoverAll(in: directory)
+            }.value
+            var messages: [String] = []
+            if !result.files.isEmpty {
+                messages.append("Recovered \(result.files.count) interrupted call(s) as playable .caf audio. Open Folder to listen.")
+            }
+            if !result.errors.isEmpty {
+                messages.append("Some recovery files could not be exported and remain on disk: " + result.errors.joined(separator: "; "))
+            }
+            recoveryMessage = messages.isEmpty ? nil : messages.joined(separator: "\n")
+            isRecovering = false
+            recoveryTask = nil
+        }
+    }
+
+    func waitForRecovery() async { await recoveryTask?.value }
 
     func toggle() {
         guard Date().timeIntervalSince(lastToggle) > 1 else { return }
@@ -171,6 +197,7 @@ final class RecordingEngine: ObservableObject {
     /// Idempotent and awaitable. Quit and relaunch use exactly this path,
     /// including when the user is still answering startup permission prompts.
     func stopAsync() async {
+        await recoveryTask?.value
         if let stopTask { await stopTask.value; return }
         guard startTask != nil || writer != nil else { return }
         let starting = startTask

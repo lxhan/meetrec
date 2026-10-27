@@ -29,5 +29,21 @@ Use non-sensitive audio and obtain any required recording consent.
 - [ ] Build without signing flags does not use your real signing certificate or reset TCC.
 - [ ] Test minimum supported macOS and latest macOS, especially native menu-bar item visibility.
 
-Force-kill/power loss recovery is not implemented. An unfinished m4a can remain
-unplayable; do not treat graceful shutdown fixes as crash resilience.
+## Call apps and interruption recovery
+
+- [ ] Google Meet/browser call: both sides audible, no duplicated echo; mute and stop work.
+- [ ] Native Zoom and Microsoft Teams: same checks, including during call reconnect.
+- [ ] Arbitrary system audio + microphone: no app-specific assumptions.
+- [ ] During a non-sensitive test recording, force-kill MeetRec; relaunch and verify
+  automatic `.caf` recovery includes journaled speech through the interruption.
+- [ ] Encoder/container failure: recovery retains accepted audio independently of AAC.
+- [ ] Interrupted recovery export: original `.pcm` parts remain; next retry succeeds.
+- [ ] Another running session is skipped, not exported/deleted as a crashed call.
+- [ ] Healthy stop: final `.m4a` plays, associated journal is removed, file modes remain private.
+- [ ] Check disk requirements: journal ~0.7 GB/hour plus AAC; recovery needs an extra PCM copy.
+
+Automated tests include actual SIGKILL of a synthetic journal-writing subprocess.
+They do not simulate power loss or verify hardware flush guarantees. An unfinished
+m4a may remain unplayable, while its journal recovers separately as `.caf`. Audio
+still buffered in the device/application can be lost. Keep independent backup for
+important calls until real-device validation passes.

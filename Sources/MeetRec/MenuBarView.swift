@@ -38,6 +38,15 @@ struct MenuBarView: View {
                 level: engine.micLevel
             )
 
+            if let message = engine.recoveryMessage {
+                Label(message, systemImage: "arrow.clockwise.circle")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button("Recover Interrupted Calls") { engine.recoverInterruptedRecordings() }
+                .disabled(engine.isBusy || engine.isRecording)
+                .font(.caption)
+
             Text("Mute excludes audio from file; capture remains active.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -84,6 +93,7 @@ struct MenuBarView: View {
     }
 
     private var recordButtonTitle: String {
+        if engine.isRecovering { return "Recovering…" }
         if engine.requiresRestart { return "Restart Required" }
         switch engine.state {
         case .starting: return "Starting…"

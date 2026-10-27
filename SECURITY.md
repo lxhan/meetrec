@@ -1,6 +1,6 @@
 # Security policy
 
-This small fork has no security support SLA and no independently audited release.
+This project has no security support SLA and no independently audited release.
 Use reviewed source and test with non-sensitive audio before relying on it.
 
 ## Reporting
@@ -27,7 +27,11 @@ Routine non-sensitive bugs can be filed as GitHub issues.
 - No shell-interpolated relaunch, remote install commands or implicit permission resets.
 - Filenames are unique; AVAssetWriter refuses existing outputs. No deletion of
   pre-existing recording files during startup.
-- Graceful stop/quit finalizes output, but crash/power-loss recovery is not provided.
+- Graceful stop/quit finalizes output. A private, unencrypted PCM journal supports
+  interrupted-call recovery; it can contain sensitive call audio and uses about
+  0.7 GB/hour. Journal files are removed only after a verified successful save/export.
+  Failed recovery leaves source segments intact. Buffered/unwritten audio, disk
+  corruption, and catastrophic hardware failure are not recoverable guarantees.
 - Unified diagnostic logging is opt-in and private; avoid sharing captured audio
   or enabling private-data collection outside a controlled troubleshooting session.
 

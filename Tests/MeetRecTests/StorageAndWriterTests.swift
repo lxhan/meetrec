@@ -103,6 +103,43 @@ final class StorageAndWriterTests: XCTestCase {
         } catch {}
     }
 
+    func testWriterFailurePreservesBufferedAudioForRecovery() async throws {
+        let writer = try StereoWriter(outputURL: RecordingStorage.outputURL(in: directory))
+        try writer.start()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_800)!
+        buffer.frameLength = 4_800
+        for i in 0..<4_800 { buffer.floatChannelData![0][i] = 0.25 }
+        writer.appendMic(buffer: buffer, time: AVAudioTime(hostTime: mach_absolute_time()))
+        // Force an input failure after valid data has been accepted.
+        writer.appendMic(buffer: buffer, time: AVAudioTime(sampleTime: 0, atRate: 48_000))
+        do { try await writer.finish(); XCTFail("Expected explicit writer failure") } catch {}
+        XCTAssertFalse(try RecordingRecovery.pending(in: directory).isEmpty)
+        let result = RecordingRecovery.recoverAll(in: directory)
+        XCTAssertTrue(result.errors.isEmpty, "\(result.errors)")
+        XCTAssertEqual(try AVAudioFile(forReading: XCTUnwrap(result.files.first)).length, 4_800)
+    }
+
+    func testResampledTimelineHasNoPrimingGapsOrLostTail() async throws {
+        let writer = try StereoWriter(outputURL: RecordingStorage.outputURL(in: directory))
+        try writer.start()
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
+        let host = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 441)!
+        buffer.frameLength = 441
+        for j in 0..<441 { buffer.floatChannelData![0][j] = 0.1 }
+        for i in 0..<100 {
+            let time = AVAudioTime(hostTime: AVAudioTime.hostTime(forSeconds: host + Double(i) * 0.01))
+            writer.appendMic(buffer: buffer, time: time)
+        }
+        writer.appendMic(buffer: buffer, time: AVAudioTime(sampleTime: 0, atRate: 44_100))
+        do { try await writer.finish(); XCTFail("Expected injected timestamp error") } catch {}
+        let recovery = RecordingRecovery.recoverAll(in: directory)
+        XCTAssertTrue(recovery.errors.isEmpty, "\(recovery.errors)")
+        let audio = try AVAudioFile(forReading: XCTUnwrap(recovery.files.first))
+        XCTAssertEqual(audio.length, 48_000)
+    }
+
     /// Synthetic PCM only: no device capture, UI, microphone or screen permission.
     func testFinishDrainsMoreThanOneHeartbeatAndSecuresFile() async throws {
         let url = try RecordingStorage.outputURL(in: directory)
@@ -123,5 +160,6 @@ final class StorageAndWriterTests: XCTestCase {
         XCTAssertEqual(CMTimeGetSeconds(duration), 1.2, accuracy: 0.08)
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        XCTAssertTrue(try RecordingRecovery.pending(in: directory).isEmpty)
     }
 }

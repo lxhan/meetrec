@@ -32,7 +32,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(requestRelaunch),
             name: ScreenRecordingPermission.relaunchNotification, object: nil)
         updateStatus()
+        engine.recoverInterruptedRecordings()
         Task { @MainActor in
+            await engine.waitForRecovery()
             try? await Task.sleep(for: .seconds(1))
             ScreenRecordingPermission.checkAtLaunch()
         }

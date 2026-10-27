@@ -16,13 +16,10 @@ final class StereoWriter: @unchecked Sendable {
     private let sampleRate: Double = 48_000
     private let chunkSize = 4_800
     private let latency: Double = 0.25
-    private let workFormat: AVAudioFormat
     private var system = AudioTimeline(capacity: 480_000)
     private var mic = AudioTimeline(capacity: 480_000)
-    private var systemConverter: AVAudioConverter?
-    private var micConverter: AVAudioConverter?
-    private var systemFormat: AVAudioFormat?
-    private var micFormat: AVAudioFormat?
+    private var systemConverter: MonoAudioConverter?
+    private var micConverter: MonoAudioConverter?
     private var systemMuted = false
     private var micMuted = false
     private let micGain: Float
@@ -31,6 +28,9 @@ final class StereoWriter: @unchecked Sendable {
     private var failure: Error?
     private var finishing = false
     private var securedFile = false
+    private var encodingFailed = false
+    private var finishReplied = false
+    private var journal: RecordingJournal?
     private let callbackLock = NSLock()
     private var failureHandler: ((Error) -> Void)?
     /// Callback is retrieved under lock and invoked only on writer queue.
@@ -49,8 +49,6 @@ final class StereoWriter: @unchecked Sendable {
         }
         let db = UserDefaults.standard.double(forKey: "MicGainDb")
         micGain = pow(10, Float(db.isFinite ? min(max(db, -60), 24) : 0) / 20)
-        workFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
-                                   channels: 1, interleaved: false)!
         writer = try AVAssetWriter(outputURL: outputURL, fileType: .m4a)
         input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -66,7 +64,9 @@ final class StereoWriter: @unchecked Sendable {
     func start() throws {
         try queue.sync {
             guard writer.status == .unknown else { throw RecordingFailure("Writer already started.") }
+            journal = try RecordingJournal(outputURL: outputURL)
             guard writer.startWriting() else {
+                journal?.retainForRecovery()
                 throw writer.error ?? RecordingFailure("Cannot start recording file.")
             }
             writer.startSession(atSourceTime: .zero)
@@ -125,19 +125,21 @@ final class StereoWriter: @unchecked Sendable {
             do {
                 let values: [Float]
                 if isSystem {
-                    if systemConverter == nil || systemFormat?.isEqual(copy.format) != true {
-                        systemConverter = AVAudioConverter(from: copy.format, to: workFormat)
-                        systemFormat = copy.format
+                    if systemConverter?.sourceFormat.isEqual(copy.format) != true {
+                        try flushSystemConverter()
+                        systemConverter = try MonoAudioConverter(sourceFormat: copy.format)
                     }
-                    values = try convert(copy, using: systemConverter)
-                    try system.append(systemMuted ? Array(repeating: 0, count: values.count) : values, at: position)
+                    let delay = systemConverter!.pendingFrames
+                    values = try systemConverter!.convert(copy)
+                    try system.append(systemMuted ? Array(repeating: 0, count: values.count) : values, at: position - delay)
                 } else {
-                    if micConverter == nil || micFormat?.isEqual(copy.format) != true {
-                        micConverter = AVAudioConverter(from: copy.format, to: workFormat)
-                        micFormat = copy.format
+                    if micConverter?.sourceFormat.isEqual(copy.format) != true {
+                        try flushMicConverter()
+                        micConverter = try MonoAudioConverter(sourceFormat: copy.format)
                     }
-                    values = try convert(copy, using: micConverter)
-                    try mic.append(micMuted ? Array(repeating: 0, count: values.count) : values, at: position)
+                    let delay = micConverter!.pendingFrames
+                    values = try micConverter!.convert(copy)
+                    try mic.append(micMuted ? Array(repeating: 0, count: values.count) : values, at: position - delay)
                 }
             } catch { fail(error) }
         }
@@ -164,25 +166,60 @@ final class StereoWriter: @unchecked Sendable {
                 timer = nil
                 // Preserve the encoded prefix if draining fails but the encoder
                 // remains usable. Never cancel an otherwise salvageable recording.
-                do { try drain(through: max(system.end, mic.end)) }
+                do {
+                    try flushSystemConverter()
+                    try flushMicConverter()
+                    try drain(through: max(system.end, mic.end))
+                }
                 catch { if failure == nil { failure = error } }
                 do {
+                    try journal?.seal()
                     guard writer.status == .writing else {
                         throw writer.error ?? failure ?? RecordingFailure("Recording writer stopped unexpectedly.")
                     }
                     input.markAsFinished()
+                    let timeout = DispatchWorkItem { [self] in
+                        guard !finishReplied else { return }
+                        finishReplied = true
+                        journal?.retainForRecovery()
+                        journal = nil
+                        writer.cancelWriting()
+                        continuation.resume(throwing: RecordingFailure("Audio encoder finalization timed out. Audio journal retained for recovery."))
+                    }
+                    queue.asyncAfter(deadline: .now() + .seconds(10), execute: timeout)
                     writer.finishWriting { [self] in
                         queue.async {
-                            if self.writer.status != .completed {
-                                continuation.resume(throwing: self.writer.error ?? RecordingFailure("Could not finalize recording."))
-                            } else if let error = self.failure {
-                                continuation.resume(throwing: error)
-                            } else {
+                            guard !self.finishReplied else { return }
+                            self.finishReplied = true
+                            timeout.cancel()
+                            do {
+                                guard self.writer.status == .completed else {
+                                    throw self.writer.error ?? RecordingFailure("Could not finalize recording. Recoverable audio retained.")
+                                }
+                                if let error = self.failure { throw error }
+                                let fd = try RecoveryIO.openExisting(self.outputURL)
+                                do { defer { close(fd) }; try RecoveryIO.sync(fd) }
+                                let audio = try AVAudioFile(forReading: self.outputURL)
+                                let expected = self.journal?.frameCount ?? 0
+                                guard audio.length > 0, abs(audio.length - expected) <= 2_048,
+                                      audio.fileFormat.sampleRate == 48_000,
+                                      audio.fileFormat.channelCount == 2 else {
+                                    throw RecordingFailure("Saved audio failed length/format validation; recovery files retained.")
+                                }
+                                try RecoveryIO.syncDirectory(self.outputURL.deletingLastPathComponent())
+                                try self.journal?.discardAfterSuccessfulSave()
+                                self.journal = nil
                                 continuation.resume()
+                            } catch {
+                                self.journal?.retainForRecovery()
+                                self.journal = nil
+                                continuation.resume(throwing: error)
                             }
                         }
                     }
                 } catch {
+                    journal?.retainForRecovery()
+                    journal = nil
                     writer.cancelWriting()
                     continuation.resume(throwing: error)
                 }
@@ -201,29 +238,47 @@ final class StereoWriter: @unchecked Sendable {
             let sys = system.read(count)
             let own = mic.read(count)
             var mixed = [Float](repeating: 0, count: count * 2)
+            var mono = [Float](repeating: 0, count: count)
             for i in 0..<count {
                 let value = Self.softClip(sys[i] + own[i] * micGain)
+                mono[i] = value
                 mixed[2 * i] = value
                 mixed[2 * i + 1] = value
             }
-            let buffer = try makeSampleBuffer(mixed, frames: count, position: position)
-            let deadline = DispatchTime.now() + .seconds(2)
-            while !input.isReadyForMoreMediaData {
-                guard writer.status == .writing else {
-                    throw writer.error ?? RecordingFailure("Audio encoder stopped writing.")
+            // Journal first: AAC/metadata finalization must never be the sole
+            // durable copy. Journal contains exactly the post-mute saved mix.
+            try journal?.append(mono)
+            if !encodingFailed {
+                do {
+                    try encode(mixed, frames: count, position: position)
+                } catch {
+                    encodingFailed = true
+                    fail(error)
+                    // Keep journaling the remaining accepted audio even if
+                    // AAC dies; finish() will retain all segments for recovery.
                 }
-                guard DispatchTime.now() < deadline else {
-                    throw RecordingFailure("Audio encoder stalled; recording stopped.")
-                }
-                Thread.sleep(forTimeInterval: 0.001)
             }
-            guard input.append(buffer) else {
-                throw writer.error ?? RecordingFailure("Cannot write audio; check available disk space.")
+        }
+    }
+
+    private func encode(_ mixed: [Float], frames: Int, position: Int64) throws {
+        let buffer = try makeSampleBuffer(mixed, frames: frames, position: position)
+        let deadline = DispatchTime.now() + .seconds(2)
+        while !input.isReadyForMoreMediaData {
+            guard writer.status == .writing else {
+                throw writer.error ?? RecordingFailure("Audio encoder stopped writing.")
             }
-            if !securedFile {
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
-                securedFile = true
+            guard DispatchTime.now() < deadline else {
+                throw RecordingFailure("Audio encoder stalled; recording stopped.")
             }
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        guard input.append(buffer) else {
+            throw writer.error ?? RecordingFailure("Cannot write audio; check available disk space.")
+        }
+        if !securedFile {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
+            securedFile = true
         }
     }
 
@@ -259,25 +314,18 @@ final class StereoWriter: @unchecked Sendable {
         return copy
     }
 
-    private func convert(_ buffer: AVAudioPCMBuffer, using converter: AVAudioConverter?) throws -> [Float] {
-        guard let converter else { throw RecordingFailure("Unsupported audio format.") }
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * sampleRate / buffer.format.sampleRate + 1024)
-        guard let out = AVAudioPCMBuffer(pcmFormat: workFormat, frameCapacity: capacity) else {
-            throw RecordingFailure("Cannot allocate conversion buffer.")
-        }
-        var supplied = false
-        var error: NSError?
-        let status = converter.convert(to: out, error: &error) { _, state in
-            if supplied { state.pointee = .noDataNow; return nil }
-            supplied = true
-            state.pointee = .haveData
-            return buffer
-        }
-        if let error { throw error }
-        guard status != .error, let data = out.floatChannelData?[0] else {
-            throw RecordingFailure("Audio conversion failed.")
-        }
-        return Array(UnsafeBufferPointer(start: data, count: Int(out.frameLength)))
+    private func flushSystemConverter() throws {
+        guard let converter = systemConverter else { return }
+        let tail = try converter.finish()
+        try system.append(systemMuted ? Array(repeating: 0, count: tail.count) : tail, at: system.end)
+        systemConverter = nil
+    }
+
+    private func flushMicConverter() throws {
+        guard let converter = micConverter else { return }
+        let tail = try converter.finish()
+        try mic.append(micMuted ? Array(repeating: 0, count: tail.count) : tail, at: mic.end)
+        micConverter = nil
     }
 
     private func makeSampleBuffer(_ values: [Float], frames: Int, position: Int64) throws -> CMSampleBuffer {

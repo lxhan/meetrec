@@ -1,10 +1,11 @@
-# MeetRec — recording-safety fork
+# MeetRec
 
 Local macOS menu-bar recorder for microphone + system audio. No cloud, account,
 bot, analytics, network client, or third-party Swift dependencies.
 
-Fork of [BozhengLong/meetrec](https://github.com/BozhengLong/meetrec), based on
-`f98e39b`. **Upstream release downloads do not contain this fork's fixes.**
+Independently maintained for reliable local call recording. No upstream-sync
+commitment. **Use this repository's source; releases from other repositories do
+not contain these safety changes.**
 
 ## Build and use
 
@@ -93,7 +94,7 @@ defaults write com.local.meetrec DisableAEC -bool true
 Obtain participant consent where required. For transcription, use a separate local
 tool; uploading recordings to external services is outside MeetRec's local-only design.
 
-## Changes in this fork
+## Recording safety
 
 - Unique recording names; refusal to overwrite existing files/symlinks.
 - Explicit starting/recording/stopping/failed lifecycle; idempotent shutdown.
@@ -144,4 +145,6 @@ clock behavior, sleep/wake, and recent macOS menu-bar behavior. See
 
 ## License
 
-MIT; upstream attribution retained in [LICENSE](LICENSE).
+MIT; original attribution retained in [LICENSE](LICENSE).
+Originally based on [BozhengLong/meetrec](https://github.com/BozhengLong/meetrec)
+commit `f98e39b`.

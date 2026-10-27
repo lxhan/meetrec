@@ -1,5 +1,7 @@
 # MeetRec
 
+> **分支说明：** 本文件保留上游版本文档，部分内容已过时。本分支的构建方式、保存路径、安全修复与限制以 [英文 README](README.md) 为准。上游 Releases 不包含本分支的修复。请勿按下文安装旧版二进制文件。
+
 [![macOS](https://img.shields.io/badge/macOS-14.2%2B-blue)](https://www.apple.com/macos/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/BozhengLong/meetrec)](https://github.com/BozhengLong/meetrec/releases)

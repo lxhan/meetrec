@@ -40,6 +40,7 @@ final class VoiceProcessingMicCapture {
     private var didStart = false
     private var stopped = false
     private let stateLock = NSLock()
+    private let teardownLock = NSLock()
 
     fileprivate var clientFormat: AVAudioFormat?
     fileprivate var maxFrames: UInt32 = 4096
@@ -289,6 +290,10 @@ final class VoiceProcessingMicCapture {
 
     /// Idempotent; may block briefly in AUVoiceIO teardown — call off main.
     func stop() {
+        // A competing stop must wait for teardown, not return while the audio
+        // callback can still use this instance's unretained C context.
+        teardownLock.lock()
+        defer { teardownLock.unlock() }
         stateLock.lock()
         let alreadyStopped = stopped
         stopped = true

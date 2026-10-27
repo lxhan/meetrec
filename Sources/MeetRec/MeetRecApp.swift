@@ -1,74 +1,114 @@
 import SwiftUI
 import AppKit
+import Combine
 
-@main
-struct MeetRecApp: App {
-    @StateObject private var engine = RecordingEngine()
+/// Native status item avoids MenuBarExtra scene-removal termination on newer
+/// macOS (upstream PR #3). Keep bundle identity stable; no TCC-reset workaround.
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let engine = RecordingEngine()
     private let hotkeys = HotKeyManager()
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var subscription: AnyCancellable?
+    private var terminating = false
+    private var relaunchRequested = false
 
-    init() {
-        // Hide dock icon — this is a menu-bar-only app.
-        NSApplication.shared.setActivationPolicy(.accessory)
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
         Log.reset()
-        // Preflight Screen Recording access shortly after launch so missing
-        // or stale (post-upgrade) grants get guided fix-up before the first
-        // recording silently loses system audio.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.target = self
+        item.button?.action = #selector(togglePopover)
+        statusItem = item
+        popover.behavior = .transient
+        popover.contentViewController = NSHostingController(rootView: MenuBarView(engine: engine))
+        hotkeys.register(.optCmdR) { [weak self] in self?.engine.toggle() }
+        hotkeys.register(.optCmdM) { [weak self] in self?.engine.micMuted.toggle() }
+        hotkeys.register(.optCmdS) { [weak self] in self?.engine.systemMuted.toggle() }
+        subscription = engine.objectWillChange.sink { [weak self] in
+            DispatchQueue.main.async { self?.updateStatus() }
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(requestRelaunch),
+            name: ScreenRecordingPermission.relaunchNotification, object: nil)
+        updateStatus()
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1))
             ScreenRecordingPermission.checkAtLaunch()
         }
     }
 
-    var body: some Scene {
-        MenuBarExtra {
-            MenuBarView(engine: engine)
-                .onAppear { wireHotkeys() }
-        } label: {
-            HStack(spacing: 3) {
-                Image(systemName: iconName)
-                if engine.isRecording {
-                    Text(timeString(engine.elapsed))
-                        .font(.system(.body, design: .monospaced))
-                        .monospacedDigit()
-                }
+    @objc private func togglePopover() {
+        guard let button = statusItem?.button else { return }
+        if popover.isShown { popover.performClose(nil) }
+        else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    private func updateStatus() {
+        guard let button = statusItem?.button else { return }
+        let symbol: String
+        if engine.lastError != nil { symbol = "exclamationmark.circle.fill" }
+        else if engine.isRecording { symbol = "record.circle.fill" }
+        else if engine.isBusy { symbol = "hourglass" }
+        else { symbol = "record.circle" }
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "MeetRec")
+        button.image?.isTemplate = true
+        button.imagePosition = .imageLeading
+        if engine.isRecording {
+            let seconds = Int(engine.elapsed)
+            button.title = String(format: " %02d:%02d", seconds / 60, seconds % 60)
+        } else { button.title = engine.lastError == nil ? "" : " Error" }
+        button.toolTip = engine.lastError ?? "MeetRec — \(String(describing: engine.state))"
+    }
+
+    @objc private func requestRelaunch() {
+        relaunchRequested = true
+        NSApp.terminate(nil) // routes through deferred, recording-safe termination
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminating else { return .terminateLater }
+        guard engine.isBusy || engine.isRecording else { return .terminateNow }
+        terminating = true
+        Task { @MainActor in
+            await engine.stopAsync()
+            var shouldQuit = true
+            if let error = engine.lastError {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "Recording could not be saved completely"
+                alert.informativeText = error
+                alert.addButton(withTitle: "Quit Anyway")
+                alert.addButton(withTitle: "Keep Open")
+                shouldQuit = alert.runModal() == .alertFirstButtonReturn
             }
+            if !shouldQuit { relaunchRequested = false; terminating = false }
+            sender.reply(toApplicationShouldTerminate: shouldQuit)
         }
-        .menuBarExtraStyle(.window)
+        return .terminateLater
     }
 
-    private var iconName: String {
-        guard engine.isRecording else { return "record.circle" }
-        // A recording missing system audio outranks mute states — the user
-        // must notice before the meeting ends.
-        if engine.systemAudioFailed { return "exclamationmark.circle.fill" }
-        switch (engine.systemMuted, engine.micMuted) {
-        case (false, false): return "record.circle.fill"
-        case (false, true):  return "mic.slash.circle.fill"
-        case (true,  false): return "speaker.slash.circle.fill"
-        case (true,  true):  return "circle.slash"
-        }
+    func applicationWillTerminate(_ notification: Notification) {
+        guard relaunchRequested else { return }
+        // No shell: paths containing quotes, $(), backticks, etc. remain data.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-n", Bundle.main.bundlePath]
+        do { try process.run() }
+        catch { Log.write("relaunch failed: \(error.localizedDescription)") }
     }
+}
 
-    private func timeString(_ t: TimeInterval) -> String {
-        let total = Int(t)
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        return h > 0
-            ? String(format: "%d:%02d:%02d", h, m, s)
-            : String(format: "%02d:%02d", m, s)
-    }
-
-    private func wireHotkeys() {
-        hotkeys.unregisterAll()
-        hotkeys.register(.optCmdM) {
-            engine.micMuted.toggle()
-        }
-        hotkeys.register(.optCmdS) {
-            engine.systemMuted.toggle()
-        }
-        hotkeys.register(.optCmdR) {
-            engine.toggle()
-        }
+@main
+struct MeetRecApp {
+    @MainActor
+    static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) { application.run() }
     }
 }
